@@ -1,0 +1,148 @@
+// TCC Henrique Valiati - Monitoramento em redes de baixa e média tensão.
+// ESP NÓ - INCLINAÇÃO 
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <MPU6050_light.h>
+
+#define ID_DISPOSITIVO   3        
+#define ID_REFERENCIA    2        
+
+#define SSID_AP          "Poste"
+#define SENHA_AP         "12345678"
+#define CANAL_WIFI       6
+#define CHAVE_ESPNOW     "CHAVE_PMK_16B"
+
+#define PINO_VBAT        36       
+#define FATOR_BAT        2.0f     
+
+TinyGPSPlus gps;
+MPU6050 mpu(Wire);
+
+enum TipoNo : uint8_t { NO_TENSAO=1, NO_CORRENTE=2, NO_INCLINACAO=3 };
+
+typedef struct __attribute__((packed)) {
+  uint32_t id_dispositivo;
+  uint8_t  tipo_no;
+  uint32_t id_referencia;
+  float    latitude, longitude;
+  float    inclinacao_graus;
+  char     status[10];
+  float    tensao_bateria;
+  int32_t  rssi;
+  float    tensao_r, tensao_s, tensao_t;
+  float    corrente_r, corrente_s, corrente_t;
+  uint32_t contador;
+  uint32_t tempo_segundos;
+} PacoteNo;
+
+PacoteNo pacote;
+uint32_t contadorEnvios=0;
+
+void configurarADC(int pino){
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(pino, ADC_11db);
+  for(int i=0;i<30;i++) analogRead(pino);
+}
+
+float lerBateria(){
+  int bruto   = analogRead(PINO_VBAT);
+  float v_adc = (bruto/4095.0f)*3.30f;
+  return v_adc * FATOR_BAT;
+}
+
+void iniciarGPS(){
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+}
+
+bool lerGPS(float &lat,float &lon){
+  while(Serial2.available()) gps.encode(Serial2.read());
+  if(gps.location.isValid()){
+    lat=gps.location.lat();
+    lon=gps.location.lng();
+    return true;
+  }
+  return false;
+}
+
+void iniciarMPU(){
+  Wire.begin(21,22);
+  mpu.begin();
+  delay(200);
+  mpu.calcGyroOffsets(true);
+}
+
+float lerInclinacaoGraus(){
+  mpu.update();
+  return mpu.getAngleX();
+}
+
+void aoEnviar(const uint8_t*, esp_now_send_status_t){}
+
+void setup(){
+  Serial.begin(115200);
+
+  configurarADC(PINO_VBAT);
+  iniciarMPU();
+  iniciarGPS();
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if(esp_now_init()!=ESP_OK){
+    Serial.println("Falha ESP-NOW");
+    ESP.restart();
+  }
+  esp_now_set_pmk((uint8_t*)CHAVE_ESPNOW);
+  esp_now_register_send_cb(aoEnviar);
+
+  esp_now_peer_info_t peer{};
+  for(int i=0;i<6;i++) peer.peer_addr[i]=0xFF;
+  peer.channel=CANAL_WIFI;
+  esp_now_add_peer(&peer);
+
+  memset(&pacote, 0, sizeof(pacote));
+  pacote.id_dispositivo = ID_DISPOSITIVO;
+  pacote.tipo_no        = NO_INCLINACAO;
+  pacote.id_referencia  = ID_REFERENCIA;
+}
+
+void loop(){
+  float v_bat = lerBateria();
+
+  float lat=0, lon=0;
+  lerGPS(lat, lon);
+
+  float inc = lerInclinacaoGraus();
+
+  pacote.latitude         = lat;
+  pacote.longitude        = lon;
+  pacote.inclinacao_graus = inc;
+  pacote.tensao_bateria   = v_bat;
+
+  pacote.tensao_r         = 0;
+  pacote.tensao_s         = 0;
+  pacote.tensao_t         = 0;
+
+  pacote.corrente_r       = 0;
+  pacote.corrente_s       = 0;
+  pacote.corrente_t       = 0;
+
+  pacote.contador         = ++contadorEnvios;
+  pacote.tempo_segundos   = millis()/1000;
+
+  esp_now_send(nullptr, (uint8_t*)&pacote, sizeof(pacote));
+
+  Serial.printf("[TILT] poste%02u -> ref %02u | inc=%.1f° | Vbat=%.2f | lat=%.5f lon=%.5f\n",
+                pacote.id_dispositivo, pacote.id_referencia,
+                inc, v_bat, lat, lon);
+
+  delay(1000);
+}
