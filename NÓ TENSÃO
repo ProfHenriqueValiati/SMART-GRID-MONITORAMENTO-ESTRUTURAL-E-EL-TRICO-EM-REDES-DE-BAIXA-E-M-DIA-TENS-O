@@ -1,0 +1,194 @@
+// TCC Henrique Valiati - Monitoramento em redes de baixa e média tensão.
+// ESP NÓ - TENSÃO
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+#include <MPU6050_light.h>
+
+#define ID_DISPOSITIVO   1
+#define ID_REFERENCIA    0
+
+#define SSID_AP          "Poste"
+#define SENHA_AP         "12345678"
+#define CANAL_WIFI       6
+#define CHAVE_ESPNOW     "CHAVE_PMK_16B"
+
+#define PINO_VR          34
+#define PINO_VS          35
+#define PINO_VT          32
+#define PINO_VBAT        33
+
+#define CAL_TENSAO       700.0f
+#define FATOR_BAT        1.5f
+
+TinyGPSPlus gps;
+MPU6050 mpu(Wire);
+
+enum TipoNo : uint8_t { NO_TENSAO=1, NO_CORRENTE=2, NO_INCLINACAO=3 };
+
+typedef struct __attribute__((packed)) {
+  uint32_t id_dispositivo;
+  uint8_t  tipo_no;
+  uint32_t id_referencia;
+  float    latitude, longitude;
+  float    inclinacao_graus;
+  char     status[10];
+  float    tensao_bateria;
+  int32_t  rssi;
+  float    tensao_r, tensao_s, tensao_t;
+  float    corrente_r, corrente_s, corrente_t;
+  uint32_t contador;
+  uint32_t tempo_segundos;
+} PacoteNo;
+
+PacoteNo pacote;
+uint32_t contadorEnvios = 0;
+
+uint8_t MAC_MESTRE[] = { 0x6C, 0xC8, 0x40, 0x34, 0x4B, 0xC4 };
+
+void configurarADC(int pino){
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(pino, ADC_11db);
+  for(int i=0;i<30;i++) analogRead(pino);
+}
+
+float rmsADC(int pino, int N=2500){
+  double soma=0;
+  for(int i=0;i<N;i++) soma += analogRead(pino);
+  double media = soma/N;
+  double sq=0;
+  for(int i=0;i<N;i++){
+    double ac = analogRead(pino) - media;
+    sq += ac*ac;
+  }
+  double rms_counts = sqrt(sq/N);
+  return (rms_counts/4095.0)*3.30;
+}
+
+float lerBateria(){
+  int bruto   = analogRead(PINO_VBAT);
+  float v_adc = (bruto/4095.0f)*3.30f;
+  return v_adc * FATOR_BAT;
+}
+
+void iniciarGPS(){
+  Serial2.begin(9600, SERIAL_8N1, 16, 17);
+}
+
+bool lerGPS(float &lat,float &lon){
+  while(Serial2.available()) gps.encode(Serial2.read());
+  if(gps.location.isValid()){
+    lat=gps.location.lat();
+    lon=gps.location.lng();
+    return true;
+  }
+  return false;
+}
+
+void iniciarMPU(){
+  Wire.begin(21,22);
+  mpu.begin();
+  delay(200);
+  mpu.calcGyroOffsets();
+}
+
+float lerInclinacaoGraus(){
+  mpu.update();
+  return mpu.getAngleX();
+}
+
+void aoEnviar(const wifi_tx_info_t* info, esp_now_send_status_t status){
+  Serial.print("[SEND] ");
+  if (status == ESP_NOW_SEND_SUCCESS) Serial.println("OK");
+  else                                Serial.println("FALHA");
+}
+
+void setup(){
+  Serial.begin(115200);
+
+  configurarADC(PINO_VR);
+  configurarADC(PINO_VS);
+  configurarADC(PINO_VT);
+  configurarADC(PINO_VBAT);
+
+  iniciarMPU();
+  iniciarGPS();
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if(esp_now_init()!=ESP_OK){
+    Serial.println("Falha ESP-NOW");
+    ESP.restart();
+  }
+
+  esp_now_set_pmk((uint8_t*)CHAVE_ESPNOW);
+  esp_now_register_send_cb(aoEnviar);
+
+  esp_now_peer_info_t peer{};
+  memset(&peer, 0, sizeof(peer));
+  memcpy(peer.peer_addr, MAC_MESTRE, 6);
+  peer.channel = CANAL_WIFI;
+  peer.encrypt = false;
+
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("Erro ao adicionar mestre");
+  } else {
+    Serial.println("Mestre adicionado");
+  }
+
+  memset(&pacote, 0, sizeof(pacote));
+  pacote.id_dispositivo = ID_DISPOSITIVO;
+  pacote.tipo_no        = NO_TENSAO;
+  pacote.id_referencia  = ID_REFERENCIA;
+
+  Serial.println("No de tensao iniciado");
+}
+
+void loop(){
+  float vr_adc = rmsADC(PINO_VR);
+  float vs_adc = rmsADC(PINO_VS);
+  float vt_adc = rmsADC(PINO_VT);
+
+  float vr = vr_adc * CAL_TENSAO;
+  float vs = vs_adc * CAL_TENSAO;
+  float vt = vt_adc * CAL_TENSAO;
+
+  float v_bat = lerBateria();
+
+  float lat=0, lon=0;
+  lerGPS(lat, lon);
+
+  float inc = lerInclinacaoGraus();
+
+  pacote.latitude         = lat;
+  pacote.longitude        = lon;
+  pacote.inclinacao_graus = inc;
+  pacote.tensao_bateria   = v_bat;
+
+  pacote.tensao_r         = vr;
+  pacote.tensao_s         = vs;
+  pacote.tensao_t         = vt;
+
+  pacote.corrente_r       = 0;
+  pacote.corrente_s       = 0;
+  pacote.corrente_t       = 0;
+
+  pacote.contador         = ++contadorEnvios;
+  pacote.tempo_segundos   = millis()/1000;
+
+  esp_err_t r = esp_now_send(MAC_MESTRE, (uint8_t*)&pacote, sizeof(pacote));
+
+  Serial.printf("[TENSAO] poste%02u | VR=%.1f VS=%.1f VT=%.1f V | inc=%.1f | Vbat=%.2f | send=%s\n",
+                pacote.id_dispositivo, vr, vs, vt, inc, v_bat,
+                (r == ESP_OK ? "OK" : "ERRO"));
+
+  delay(1000);
+}
