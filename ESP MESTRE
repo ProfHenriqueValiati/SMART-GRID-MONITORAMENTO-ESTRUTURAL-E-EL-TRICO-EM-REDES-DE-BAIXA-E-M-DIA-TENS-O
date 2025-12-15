@@ -1,0 +1,271 @@
+// TCC Henrique Valiati - Monitoramento em redes de baixa e média tensão.
+// ESP MESTRE
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <esp_err.h>
+
+#define SSID_AP        "Poste"
+#define SENHA_AP       "12345678"
+#define CANAL_WIFI     6
+#define PORTA_TCP      9000
+#define CHAVE_ESPNOW   "CHAVE_PMK_16B"
+
+const char* SERVIDOR_IP    = "192.168.4.2";
+const int   SERVIDOR_PORTA = 5000;
+const char* SERVIDOR_ROTA  = "/api/ingest";
+
+WiFiServer servidorTcp(PORTA_TCP);
+const int MAX_CLIENTES = 6;
+WiFiClient clientes[MAX_CLIENTES];
+
+enum TipoNo : uint8_t { NO_TENSAO=1, NO_CORRENTE=2, NO_INCLINACAO=3 };
+
+typedef struct __attribute__((packed)){
+  uint32_t id_dispositivo;
+  uint8_t  tipo_no;
+  uint32_t id_referencia;
+  float    latitude, longitude;
+  float    inclinacao_graus;
+  char     status[10];
+  float    tensao_bateria;
+  int32_t  rssi;
+  float    tensao_r, tensao_s, tensao_t;
+  float    corrente_r, corrente_s, corrente_t;
+  uint32_t contador;
+  uint32_t tempo_segundos;
+} PacoteNo;
+
+struct CacheNo {
+  bool     valido        = false;
+  uint32_t id_dispositivo = 0;
+  PacoteNo pacote{};
+  uint32_t ultimo_ms     = 0;
+};
+
+CacheNo cache[32];
+
+static inline const char* statusPorInclinacao(float inc){
+  float a = fabsf(inc);
+  if (a < 10.0f)  return "normal";
+  if (a < 20.0f)  return "alerta";
+  return "falha";
+}
+
+static inline String nomePoste(uint32_t id){
+  String s;
+  if(id < 10) s = "poste0" + String(id);
+  else        s = "poste"  + String(id);
+  return s;
+}
+
+static inline void enviarLinhaJSON(const String& linha){
+  Serial.print(linha);
+  for(int i=0;i<MAX_CLIENTES;i++){
+    if(clientes[i] && clientes[i].connected()){
+      clientes[i].print(linha);
+    }
+  }
+}
+
+static inline int indiceCache(uint32_t id){
+  for(size_t i=0;i<sizeof(cache)/sizeof(cache[0]);i++){
+    if(cache[i].valido && cache[i].id_dispositivo == id) return (int)i;
+  }
+  return -1;
+}
+
+static inline int alocarCache(uint32_t id){
+  int idx = indiceCache(id);
+  if(idx >= 0) return idx;
+  for(size_t i=0;i<sizeof(cache)/sizeof(cache[0]);i++){
+    if(!cache[i].valido){
+      cache[i].valido         = true;
+      cache[i].id_dispositivo = id;
+      return (int)i;
+    }
+  }
+  int maisAntigo = 0;
+  for(size_t i=1;i<sizeof(cache)/sizeof(cache[0]);i++){
+    if(cache[i].ultimo_ms < cache[maisAntigo].ultimo_ms) maisAntigo = (int)i;
+  }
+  cache[maisAntigo].valido         = true;
+  cache[maisAntigo].id_dispositivo = id;
+  return maisAntigo;
+}
+
+void aoReceber(const esp_now_recv_info *info, const uint8_t *dados, int tamanho){
+  if(tamanho != (int)sizeof(PacoteNo)) return;
+
+  PacoteNo p;
+  memcpy(&p, dados, sizeof(p));
+
+  int rssiPadrao = WiFi.RSSI();
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+  if(info && info->rx_ctrl) p.rssi = info->rx_ctrl->rssi;
+  else                      p.rssi = rssiPadrao;
+#else
+  p.rssi = rssiPadrao;
+#endif
+
+  int idx = alocarCache(p.id_dispositivo);
+  cache[idx].pacote    = p;
+  cache[idx].ultimo_ms = millis();
+
+  String j;
+  j.reserve(360);
+  j+="{";
+  j+="\"device_id\":"+String(p.id_dispositivo);
+  j+=",\"tipo_no\":"+String(p.tipo_no);
+  j+=",\"ref_id\":"+String(p.id_referencia);
+  j+=",\"lat\":"+String(p.latitude,7);
+  j+=",\"lon\":"+String(p.longitude,7);
+  j+=",\"tilt_deg\":"+String(p.inclinacao_graus,2);
+  j+=",\"status\":\""+String(statusPorInclinacao(p.inclinacao_graus))+"\"";
+  j+=",\"vbat\":"+String(p.tensao_bateria,2);
+  j+=",\"rssi\":"+String(p.rssi);
+  j+=",\"vR\":"+String(p.tensao_r,1);
+  j+=",\"vS\":"+String(p.tensao_s,1);
+  j+=",\"vT\":"+String(p.tensao_t,1);
+  j+=",\"iR\":"+String(p.corrente_r,2);
+  j+=",\"iS\":"+String(p.corrente_s,2);
+  j+=",\"iT\":"+String(p.corrente_t,2);
+  j+=",\"counter\":"+String(p.contador);
+  j+=",\"ts\":"+String(p.tempo_segundos);
+  j+="}\n";
+
+  enviarLinhaJSON(j);
+}
+
+void enviarLoteServidor(){
+  const uint32_t agora     = millis();
+  const uint32_t fresco_ms = 5000;
+  int qtd = 0;
+
+  for(auto &c : cache){
+    if(c.valido && (agora - c.ultimo_ms) <= fresco_ms) qtd++;
+  }
+  if(qtd == 0) return;
+
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.to<JsonArray>();
+
+  for(auto &c : cache){
+    if(!(c.valido && (agora - c.ultimo_ms) <= fresco_ms)) continue;
+    const PacoteNo &p = c.pacote;
+
+    JsonObject o = arr.createNestedObject();
+    o["device_id"] = p.id_dispositivo;
+    o["nome"]      = nomePoste(p.id_dispositivo);
+    o["lat"]       = p.latitude;
+    o["lon"]       = p.longitude;
+    o["ref_id"]    = p.id_referencia;
+    o["status"]    = statusPorInclinacao(p.inclinacao_graus);
+
+    if(p.tipo_no == NO_TENSAO){
+      o["tensao_r"]   = p.tensao_r;
+      o["tensao_s"]   = p.tensao_s;
+      o["tensao_t"]   = p.tensao_t;
+      o["corrente_r"] = 0;
+      o["corrente_s"] = 0;
+      o["corrente_t"] = 0;
+    } else if(p.tipo_no == NO_CORRENTE){
+      o["tensao_r"]   = 0;
+      o["tensao_s"]   = 0;
+      o["tensao_t"]   = 0;
+      o["corrente_r"] = p.corrente_r;
+      o["corrente_s"] = p.corrente_s;
+      o["corrente_t"] = p.corrente_t;
+    } else {
+      o["tensao_r"]   = 0;
+      o["tensao_s"]   = 0;
+      o["tensao_t"]   = 0;
+      o["corrente_r"] = 0;
+      o["corrente_s"] = 0;
+      o["corrente_t"] = 0;
+    }
+
+    o["inclinacao"] = p.inclinacao_graus;
+    o["estrutura"]  = "";
+    o["vbat"]       = p.tensao_bateria;
+    o["rssi"]       = p.rssi;
+    o["counter"]    = p.contador;
+    o["ts_node"]    = p.tempo_segundos;
+    o["kind"]       = p.tipo_no;
+  }
+
+  String corpo;
+  serializeJson(arr, corpo);
+
+  WiFiClient cli;
+  HTTPClient http;
+  String url = String("http://") + SERVIDOR_IP + ":" + String(SERVIDOR_PORTA) + SERVIDOR_ROTA;
+
+  if(!http.begin(cli, url)) return;
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(corpo);
+
+  if(code > 0){
+    String resp = http.getString();
+  }
+
+  http.end();
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(300);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(SSID_AP, SENHA_AP, CANAL_WIFI, 0, 8);
+  IPAddress ipAp = WiFi.softAPIP();
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  servidorTcp.begin();
+
+  esp_err_t e = esp_now_init();
+  if(e != ESP_OK) ESP.restart();
+
+  e = esp_now_set_pmk((uint8_t*)CHAVE_ESPNOW);
+
+  esp_now_register_recv_cb(aoReceber);
+}
+
+void loop(){
+  if(servidorTcp.hasClient()){
+    WiFiClient candidato = servidorTcp.available();
+    if(candidato){
+      bool encaixado = false;
+      for(int i=0;i<MAX_CLIENTES;i++){
+        if(!clientes[i] || !clientes[i].connected()){
+          if(clientes[i]) clientes[i].stop();
+          clientes[i] = candidato;
+          clientes[i].println("{\"hello\":\"connected\"}\n");
+          encaixado = true;
+          break;
+        }
+      }
+      if(!encaixado) candidato.stop();
+    }
+  }
+
+  for(int i=0;i<MAX_CLIENTES;i++){
+    if(clientes[i] && !clientes[i].connected()){
+      clientes[i].stop();
+    }
+  }
+
+  static uint32_t t0 = 0;
+  if(millis() - t0 > 1000){
+    t0 = millis();
+    enviarLoteServidor();
+  }
+}
